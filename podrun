@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+
+import argparse
+import base64
+import binascii
+import copy
+import json
+import libmount
+import os
+import sys
+import tempfile
+import podrun_defaults as defaults
+import subprocess
+
+from pathlib import Path
+
+storage_path = Path(defaults.storage_path)
+
+# Loads mount info from /var/lib/containers/storage/overlay/{overlayid}
+class LayerDir:
+    def __init__(self, layerid):
+        self.id = layerid
+        self.path = storage_path / "overlay" / layerid
+        self.link_info = load_file(self.path / "link").strip()
+        self.lower_info = load_file(self.path / "lower").strip()
+
+    def lowerdir_opts(self):
+        lowerdirs=str(storage_path / "overlay/l" / self.link_info)
+        for l in self.lower_info.split(':'):
+            lowerdirs += ":" + str(storage_path / "overlay" / l)
+        return lowerdirs
+
+# Loads image info from /var/lib/containers/storage/overlay-images/{overlayid}
+class ImageDir:
+    def __init__(self, imageid):
+        self.id = imageid
+        self.digest = "sha256:" + imageid
+        self.path = storage_path / "overlay-images" / imageid
+
+    def load_config(self):
+        return load_json(self.path / to_b64_filename(self.digest))
+
+class WorkDir:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.mountdir = self.path / "merged"
+        self.upperdir = self.path / "diff"
+        self.workdir = self.path / "work"
+        os.mkdir(self.mountdir)
+        os.mkdir(self.upperdir)
+        os.mkdir(self.workdir)
+
+    def mount(self, layer_dir):
+        cxt = libmount.Context()
+        cxt.fstype = "overlay"
+        cxt.source = "overlay"
+        cxt.options = f"rw,nodev,relatime,lowerdir={layer_dir.lowerdir_opts()},upperdir={self.upperdir},workdir={self.workdir},metacopy=on"
+        cxt.target = str(self.mountdir)
+        cxt.mount()
+
+    def unmount(self):
+        cxt = libmount.Context()
+        cxt.enable_force(True)
+        cxt.enable_lazy(True)
+        cxt.target = str(self.mountdir)
+        cxt.umount()
+
+    def write_config(self, container_config):
+        write_file(self.path / "config.json", json.dumps(container_config))
+
+
+def ensure_elt(d, name, default):
+    if not name in d:
+        d[name] = default
+    return d[name]
+
+def envp_set(envp, val):
+    prefix = val.split("=")[0] + "="
+    for i in range(len(envp)):
+        if envp[i].startswith(prefix):
+            envp[i] = val
+            return
+    envp.append(val)
+
+def random_id():
+    return binascii.b2a_hex(os.urandom(15)).decode('utf8')
+
+def load_file(path):
+    with open(path) as f:
+        s = f.read()
+    return s
+
+def write_file(path, data):
+    with open(path, "w") as f:
+        s = f.write(data)
+
+def load_json(path):
+    with open(path) as f:
+        res = json.load(f)
+    return res
+
+def to_b64_filename(str):
+    return "=" + base64.b64encode(str.encode("utf8")).decode("utf8")
+
+images_json = storage_path / "overlay-images/images.json"
+
+def find_image(images_json,image):
+    for img in images_json:
+        if args.image in img.get("names", []):
+            return img
+    return None
+
+def apply_image_config(container_config, imagecfg, custom_cmd):
+    process = ensure_elt(container_config, "process", {})
+
+    config_env = ensure_elt(process, "env", [])
+    for var in imagecfg.get("Env", []):
+        envp_set(config_env, var)
+
+    workingdir = imagecfg.get("Workingdir", "")
+    if workingdir:
+        process["cwd"] = workingdir
+
+    cfg_entrypoint = imagecfg.get("Entrypoint", [])
+    cfg_cmd = imagecfg.get("Cmd", [])
+    cmdline = []
+    cmdline.extend(cfg_entrypoint)
+    cmdline.extend(custom_cmd if custom_cmd else cfg_cmd)
+
+    if len(cmdline) > 0:
+        process["args"] = cmdline
+
+parser = argparse.ArgumentParser(description='Run a container.')
+parser.add_argument('image', metavar='IMAGE', type=str,)
+parser.add_argument('cmd', nargs=argparse.REMAINDER, metavar="...", help="container arguments")
+
+args = parser.parse_args()
+
+images_json = load_json(images_json)
+image = find_image(images_json, args.image)
+
+if image == None:
+    print(f"Can't find image {args.image}")
+    sys.exit(1)
+
+image_id = image.get("id")
+image_dir = ImageDir(image_id)
+imageconfig = image_dir.load_config()
+
+layer_id = image.get("layer")
+layer_dir = LayerDir(layer_id)
+
+container_id = random_id ()
+
+container_config = copy.deepcopy(defaults.container_config)
+
+container_config["hostname"] = container_id
+apply_image_config(container_config, imageconfig.get("config", {}), args.cmd)
+
+# More things we could set
+# "linux.cgroupsPath" : "machine.slice:libpod:8fd6532582407e44ccb90669c7e8c30ff4a4c0a2d3b7bfb4b3fe2aeeb0576887",
+# "linux.mountLabel" : "system_u:object_r:container_file_t:s0:c175,c895",
+# "process.selinuxLabel" : "system_u:system_r:container_t:s0:c175,c895",
+# "process.user"
+# various mountpoints like /etc/resolve.conf
+
+with tempfile.TemporaryDirectory(prefix=f"cont-{container_id}") as tmpdir:
+    print(f"image: {image_id}, layer: {layer_id}, tmpdir: {tmpdir}")
+
+    workdir = WorkDir(tmpdir)
+    workdir.mount(layer_dir)
+
+    root = ensure_elt(container_config, "root", {})
+    root["path"] = str(workdir.mountdir)
+
+    workdir.write_config(container_config)
+    os.chdir(workdir.path)
+    subprocess.run(["crun", "run", container_id], check=True)
+    workdir.unmount()
